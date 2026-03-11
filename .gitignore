@@ -1,0 +1,5 @@
+# Spike clip videos (large files; keep out of git)
+/data/spike_clips/
+/data/spike clips/
+/data/spike_clips/**/*.mp4
+/data/spike clips/**/*.mp4
