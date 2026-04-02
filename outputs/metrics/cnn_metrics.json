@@ -1,0 +1,15 @@
+{
+    "accuracy": 0.9786931818181818,
+    "precision": 0.8571428571428571,
+    "recall": 0.6,
+    "f1": 0.7058823529411765,
+    "n_samples": 704,
+    "n_videos_loo": 6,
+    "image_size": 224,
+    "pretrained": true,
+    "epochs": 10,
+    "batch_size": 8,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.0001,
+    "device": "cuda"
+  }

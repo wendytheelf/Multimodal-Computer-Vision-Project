@@ -1,0 +1,27 @@
+# Volleyball contact-frame / Check-In 2 dependencies
+# Install:  python -m pip install -r requirements.txt
+#
+# PyTorch GPU: if you need CUDA, follow https://pytorch.org and install torch/torchvision
+# there instead of (or after) this file, matching your CUDA version.
+
+# Core numerics & data
+numpy>=1.24,<3
+pandas>=2.0
+
+# Classical baseline + evaluation
+scikit-learn>=1.3
+
+# Video / images
+opencv-python>=4.8
+
+# Figures
+matplotlib>=3.7
+
+# CNN baseline (ResNet-18). Versions support torchvision.models.ResNet18_Weights API.
+torch>=2.1,<3
+torchvision>=0.16
+
+# --- EDA & multimodal notebooks (01_EDA ipynb-style work, audio) ---
+mediapipe>=0.10.9
+librosa>=0.10.0
+soundfile>=0.12.0
