@@ -80,27 +80,27 @@ def load_all_frames_bgr(video_path: Path) -> list[np.ndarray]:
 
 class VideoFrameCache:
     """
-    Lazy cache: load each video once, then index frames by row metadata.
+    One-video buffer for triplet access (legacy helper).
 
-    Avoids reopening the same file for every window.
+    Training no longer uses a dict of **all** decodes: that OOMs with 20+ HD clips.
+    See :func:`build_feature_matrix` (single in-flight buffer) for the main path.
     """
 
     def __init__(self, raw_dir: Path) -> None:
         self.raw_dir = Path(raw_dir)
-        self._cache: dict[str, list[np.ndarray]] = {}
+        self._name: str | None = None
+        self._frames: list[np.ndarray] | None = None
 
-    def get_frames(self, video_name: str) -> list[np.ndarray]:
-        if video_name not in self._cache:
+    def get_triplet(self, video_name: str, prev_i: int, curr_i: int, next_i: int) -> list[np.ndarray]:
+        if self._name != video_name or self._frames is None:
+            self._name = video_name
             path = self.raw_dir / video_name
             if not path.is_file():
                 raise FileNotFoundError(
                     f"Video not found: {path}. Place raw files in {self.raw_dir}"
                 )
-            self._cache[video_name] = load_all_frames_bgr(path)
-        return self._cache[video_name]
-
-    def get_triplet(self, video_name: str, prev_i: int, curr_i: int, next_i: int) -> list[np.ndarray]:
-        all_f = self.get_frames(video_name)
+            self._frames = load_all_frames_bgr(path)
+        all_f = self._frames
         n = len(all_f)
         for idx, name in ((prev_i, "prev_frame"), (curr_i, "curr_frame"), (next_i, "next_frame")):
             if idx < 0 or idx >= n:
@@ -115,23 +115,41 @@ class VideoFrameCache:
 
 def build_feature_matrix(
     df: pd.DataFrame,
-    cache: VideoFrameCache,
+    raw_dir: Path,
     hog: cv2.HOGDescriptor,
     *,
     max_width: int,
 ) -> np.ndarray:
     """
     One row per dataset row: handcrafted feature vector.
+
+    **Memory:** only one full video is kept decoded at a time. When
+    ``video_name`` changes between rows, the previous buffer is released.
+    This avoids the Linux OOM killer when *many* long HD clips are in the dataset.
     """
+    raw_dir = Path(raw_dir)
     rows: list[np.ndarray] = []
+    last_name: str | None = None
+    all_f: list[np.ndarray] | None = None
 
     for _, row in df.iterrows():
-        trip = cache.get_triplet(
-            str(row["video_name"]),
-            int(row["prev_frame"]),
-            int(row["curr_frame"]),
-            int(row["next_frame"]),
-        )
+        name = str(row["video_name"])
+        if name != last_name or all_f is None:
+            all_f = None
+            last_name = name
+            path = raw_dir / name
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"Video not found: {path}. Place raw files in {raw_dir}"
+                )
+            all_f = load_all_frames_bgr(path)
+
+        n = len(all_f)
+        prev_i, curr_i, next_i = int(row["prev_frame"]), int(row["curr_frame"]), int(row["next_frame"])
+        for idx, label in ((prev_i, "prev_frame"), (curr_i, "curr_frame"), (next_i, "next_frame")):
+            if idx < 0 or idx >= n:
+                raise IndexError(f"{label}={idx} out of range for {name} (n={n})")
+        trip = [all_f[prev_i], all_f[curr_i], all_f[next_i]]
         feat = combine_handcrafted_features(
             trip,
             max_width=max_width,
@@ -298,11 +316,10 @@ def main() -> None:
         raise ValueError(f"Dataset missing columns {missing}: {args.dataset}")
 
     y = df["label"].astype(int).values
-    cache = VideoFrameCache(args.raw_dir)
     hog = build_hog_descriptor()
 
     print(f"Building features for {len(df)} windows from {args.dataset} ...")
-    X = build_feature_matrix(df, cache, hog, max_width=feature_max_width)
+    X = build_feature_matrix(df, args.raw_dir, hog, max_width=feature_max_width)
     print(f"Feature matrix shape: {X.shape}")
 
     print("Leave-one-video-out evaluation ...")

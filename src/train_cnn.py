@@ -1,16 +1,21 @@
 """
-CNN baseline: ResNet-18 on 3-frame grayscale stacks for contact-window classification.
+CNN baseline: ResNet-18 on grayscale frame stacks for contact-window classification.
 
 Each sample uses the same rows as ``build_dataset.py`` / ``dataset_windows.csv``:
-frames (t-1, t, t+1) from ``data/raw_videos/<video_name>``. Frames are converted to
-grayscale and stacked along the channel dimension so the tensor shape is **(3, H, W)**,
-which matches ResNet's expected 3 input channels.
+``W`` frames centered at ``center_frame`` (default ``W=3`` → (t-1, t, t+1)). Frames are
+converted to grayscale and stacked along the channel dimension so the tensor shape is
+**(W, H, W_px)**. With ``--window-size 3`` the behaviour is identical to the Check-In 2
+baseline; with larger ``W`` the CNN's ``conv1`` is rebuilt to accept ``W`` channels and
+pretrained ImageNet weights are averaged/tiled to initialize the new filters.
 
 **Leave-one-video-out (LOO)** evaluation trains on all videos except one, tests on the
 held-out video, and repeats—no leakage across videos.
 
 With only a handful of short clips, a full CNN can **overfit** quickly; treat metrics as
 directional unless you add regularization, more data, or stronger augmentation.
+
+Frames are decoded **on demand** via ``cv2.VideoCapture`` (bounded RAM); previously the
+trainer cached **entire decoded clips**, which caused OS out-of-memory kills on long videos.
 
 Outputs:
   * ``outputs/metrics/cnn_metrics.json``
@@ -53,6 +58,9 @@ PREDICTIONS_CSV = PROJECT_ROOT / "outputs" / "predictions" / "cnn_predictions.cs
 # Image side length for ResNet (224 is standard for ImageNet-pretrained models)
 IMAGE_SIZE = 224
 
+# Temporal window size (must be odd). 3 = (t-1, t, t+1), i.e. Check-In 2 baseline.
+WINDOW_SIZE = 3
+
 # Use ImageNet pretrained weights when True (motion grayscale channels ≠ natural RGB;
 # still useful as a strong init, but ``False`` is a fairer "from scratch" baseline)
 USE_PRETRAINED = True
@@ -69,67 +77,133 @@ NUM_WORKERS = 0
 
 
 # -----------------------------------------------------------------------------
-# Video loading (short clips: keep all frames in RAM)
+# Video loading — stream frames on demand (bounded RAM)
 # -----------------------------------------------------------------------------
-def load_all_frames_bgr(video_path: Path) -> list[np.ndarray]:
-    """Load every frame as BGR uint8."""
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise FileNotFoundError(f"Cannot open video: {video_path}")
-    frames: list[np.ndarray] = []
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frames.append(frame)
-    finally:
-        cap.release()
-    return frames
+class VideoWindowLoader:
+    """
+    Read only the ``window_size`` BGR frames needed per sample via ``cv2.VideoCapture``.
 
-
-class VideoFrameCache:
-    """Cache decoded videos by ``video_name`` to avoid reopening files."""
+    Avoids decoding entire clips into RAM (which caused OS OOM kills during LOO when many
+    long videos were cached at once). Keeps one capture handle per video per fold.
+    """
 
     def __init__(self, raw_dir: Path) -> None:
         self.raw_dir = Path(raw_dir)
-        self._cache: dict[str, list[np.ndarray]] = {}
+        self._caps: dict[str, cv2.VideoCapture] = {}
+        self._frame_counts: dict[str, int] = {}
+        # After the first failed seek+read on a file, skip broken seeks for speed.
+        self._avoid_pos_seek: set[str] = set()
 
-    def get_triplet(self, video_name: str, prev_i: int, curr_i: int, next_i: int) -> list[np.ndarray]:
-        if video_name not in self._cache:
+    def clear(self) -> None:
+        """Release capture handles between LOO folds."""
+        for cap in self._caps.values():
+            cap.release()
+        self._caps.clear()
+        self._frame_counts.clear()
+        self._avoid_pos_seek.clear()
+
+    def _ensure_cap(self, video_name: str) -> cv2.VideoCapture:
+        if video_name not in self._caps:
             path = self.raw_dir / video_name
             if not path.is_file():
                 raise FileNotFoundError(f"Video not found: {path}. Expected under {self.raw_dir}")
-            self._cache[video_name] = load_all_frames_bgr(path)
-        all_f = self._cache[video_name]
-        n = len(all_f)
-        for idx, name in ((prev_i, "prev_frame"), (curr_i, "curr_frame"), (next_i, "next_frame")):
-            if idx < 0 or idx >= n:
-                raise IndexError(f"{name}={idx} out of range for {video_name} (n={n})")
-        return [all_f[prev_i], all_f[curr_i], all_f[next_i]]
+            cap = cv2.VideoCapture(str(path))
+            if not cap.isOpened():
+                raise FileNotFoundError(f"Cannot open video: {path}")
+            self._caps[video_name] = cap
+            n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            self._frame_counts[video_name] = max(n, 1)
+        return self._caps[video_name]
+
+    def get_window(self, video_name: str, center_frame: int, window_size: int) -> list[np.ndarray]:
+        """
+        Return ``window_size`` frames centered on ``center_frame``, clamping at edges.
+
+        Indices outside ``[0, n-1]`` map to boundary frames (same semantics as before).
+
+        Prefer one contiguous decode starting at ``min(indices)`` when seeking works; some
+        codecs reject ``CAP_PROP_POS_FRAMES`` — then decode sequentially from the start up
+        to ``max(indices)`` once per window.
+        """
+        if window_size % 2 == 0 or window_size < 1:
+            raise ValueError(f"window_size must be a positive odd int, got {window_size}")
+        cap = self._ensure_cap(video_name)
+        n = self._frame_counts[video_name]
+        if n <= 0:
+            raise RuntimeError(f"Video has 0 frames reported by decoder: {video_name}")
+        half = window_size // 2
+        center = int(center_frame)
+        fis = [max(0, min(n - 1, center + off)) for off in range(-half, half + 1)]
+        lo, hi = min(fis), max(fis)
+
+        if video_name not in self._avoid_pos_seek:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, lo)
+            blk: list[np.ndarray] = []
+            for _ in range(hi - lo + 1):
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    blk.clear()
+                    break
+                blk.append(frame)
+            if len(blk) == hi - lo + 1:
+                idx_map = {lo + i: blk[i] for i in range(len(blk))}
+                return [idx_map[fi] for fi in fis]
+            self._avoid_pos_seek.add(video_name)
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        decoded: list[np.ndarray] = []
+        for _ in range(hi + 1):
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            decoded.append(frame)
+        if not decoded:
+            raise RuntimeError(f"Could not decode any frame from {video_name}")
+        last_f = decoded[-1]
+
+        def pick(i: int) -> np.ndarray:
+            if i < len(decoded):
+                return decoded[i]
+            return last_f
+
+        return [pick(fi) for fi in fis]
+
+    def get_triplet(self, video_name: str, prev_i: int, curr_i: int, next_i: int) -> list[np.ndarray]:  # noqa: ARG002
+        return self.get_window(video_name, curr_i, 3)
 
 
+# Back-compat alias used elsewhere in older notes.
+VideoFrameCache = VideoWindowLoader
+
 # -----------------------------------------------------------------------------
-# Grayscale 3-frame tensor (3-channel image)
+# Grayscale W-frame tensor (W-channel image)
 # -----------------------------------------------------------------------------
-def bgr_triplet_to_gray_stack_tensor(
+def bgr_window_to_gray_stack_tensor(
     frames_bgr: list[np.ndarray],
     image_size: int,
 ) -> torch.Tensor:
     """
-    Convert three BGR frames to a single tensor (3, H, W) with values in [0, 1].
+    Convert ``W`` BGR frames to a single tensor (W, image_size, image_size) in [0, 1].
 
-    Channel order: [t-1, t, t+1] grayscale maps stacked as channels.
+    Channel order matches the input list order, i.e. frames from earliest to latest
+    relative to ``center_frame``.
     """
-    if len(frames_bgr) != 3:
-        raise ValueError(f"Expected 3 BGR frames, got {len(frames_bgr)}")
+    if len(frames_bgr) < 1:
+        raise ValueError("Expected at least 1 BGR frame")
     chans: list[np.ndarray] = []
     for bgr in frames_bgr:
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         gray = cv2.resize(gray, (image_size, image_size), interpolation=cv2.INTER_AREA)
         chans.append(gray.astype(np.float32) / 255.0)
-    x = np.stack(chans, axis=0)  # (3, H, W)
+    x = np.stack(chans, axis=0)  # (W, H, W_px)
     return torch.from_numpy(x)
+
+
+# Back-compat alias for any external callers.
+def bgr_triplet_to_gray_stack_tensor(
+    frames_bgr: list[np.ndarray], image_size: int
+) -> torch.Tensor:
+    return bgr_window_to_gray_stack_tensor(frames_bgr, image_size)
 
 
 # -----------------------------------------------------------------------------
@@ -139,33 +213,39 @@ class VolleyballWindowDataset(Dataset):
     """
     One row of ``dataset_windows.csv`` → one (x, y) pair.
 
-    ``x``: float32 tensor (3, image_size, image_size)
+    ``x``: float32 tensor (window_size, image_size, image_size)
     ``y``: int64 scalar label 0/1
+
+    The window is sampled dynamically around ``center_frame`` using streaming decode with
+    edge clamping, so RAM stays bounded even for long clips.
     """
 
     def __init__(
         self,
         df: pd.DataFrame,
-        cache: VideoFrameCache,
+        cache: VideoWindowLoader,
         *,
         image_size: int,
+        window_size: int = 3,
     ) -> None:
+        if window_size % 2 == 0 or window_size < 1:
+            raise ValueError(f"window_size must be a positive odd int, got {window_size}")
         self.df = df.reset_index(drop=True)
         self.cache = cache
         self.image_size = int(image_size)
+        self.window_size = int(window_size)
 
     def __len__(self) -> int:
         return len(self.df)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         row = self.df.iloc[idx]
-        trip = self.cache.get_triplet(
+        frames = self.cache.get_window(
             str(row["video_name"]),
-            int(row["prev_frame"]),
-            int(row["curr_frame"]),
-            int(row["next_frame"]),
+            int(row["center_frame"]),
+            self.window_size,
         )
-        x = bgr_triplet_to_gray_stack_tensor(trip, self.image_size)
+        x = bgr_window_to_gray_stack_tensor(frames, self.image_size)
         y = torch.tensor(int(row["label"]), dtype=torch.int64)
         return x, y
 
@@ -173,16 +253,41 @@ class VolleyballWindowDataset(Dataset):
 # -----------------------------------------------------------------------------
 # Model
 # -----------------------------------------------------------------------------
-def build_resnet18_binary(*, pretrained: bool) -> nn.Module:
+def build_resnet18_binary(*, pretrained: bool, in_channels: int = 3) -> nn.Module:
     """
     ResNet-18 with final layer replaced for 2-way (non-contact vs contact) classification.
 
     Args:
-        pretrained: If True, load ImageNet weights (all 3 input channels use the same
-            conv1 filters — compatible with our 3-channel input shape).
+        pretrained: If True, load ImageNet weights.
+        in_channels: Number of input channels (= temporal window size). For values other
+            than 3, ``conv1`` is rebuilt with ``in_channels`` channels. When ``pretrained``
+            is True, the pretrained ``conv1`` weights are averaged across RGB and tiled
+            across the new channel dimension (a standard "inflate" trick for stacked-frame
+            video inputs), and scaled by ``3 / in_channels`` so the pre-BN activation
+            magnitude stays similar to the 3-channel init.
     """
     weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
     model = resnet18(weights=weights)
+
+    if in_channels != 3:
+        old = model.conv1  # Conv2d(3, 64, k=7, s=2, p=3, bias=False)
+        new = nn.Conv2d(
+            in_channels,
+            old.out_channels,
+            kernel_size=old.kernel_size,
+            stride=old.stride,
+            padding=old.padding,
+            bias=(old.bias is not None),
+        )
+        with torch.no_grad():
+            if pretrained:
+                mean_w = old.weight.mean(dim=1, keepdim=True)  # (64, 1, 7, 7)
+                scale = 3.0 / float(in_channels)
+                new.weight.copy_(mean_w.repeat(1, in_channels, 1, 1) * scale)
+                if new.bias is not None and old.bias is not None:
+                    new.bias.copy_(old.bias)
+        model.conv1 = new
+
     in_feats = model.fc.in_features
     model.fc = nn.Linear(in_feats, 2)
     return model
@@ -289,9 +394,14 @@ def leave_one_video_out_cnn(
     weight_decay: float,
     random_seed: int,
     num_workers: int,
+    window_size: int = 3,
 ) -> tuple[dict[str, float | int | bool], pd.DataFrame]:
     """
     Train/eval with LOO by ``video_name``; pool all test predictions for global metrics.
+
+    ``window_size`` controls how many frames are stacked as channels around each
+    sample's ``center_frame``. Defaults to 3 (Check-In 2 baseline); larger odd values
+    (e.g. 7, 11) provide more temporal context for the Tier 2 ablation.
     """
     videos = sorted(df["video_name"].unique())
     if len(videos) < 2:
@@ -312,14 +422,18 @@ def leave_one_video_out_cnn(
     all_video: list[str] = []
     all_center: list[int] = []
 
-    cache = VideoFrameCache(raw_dir)
+    cache = VideoWindowLoader(raw_dir)
 
     for test_vid in videos:
         train_df = df[df["video_name"] != test_vid].copy()
         test_df = df[df["video_name"] == test_vid].copy()
 
-        train_ds = VolleyballWindowDataset(train_df, cache, image_size=image_size)
-        test_ds = VolleyballWindowDataset(test_df, cache, image_size=image_size)
+        train_ds = VolleyballWindowDataset(
+            train_df, cache, image_size=image_size, window_size=window_size
+        )
+        test_ds = VolleyballWindowDataset(
+            test_df, cache, image_size=image_size, window_size=window_size
+        )
 
         train_loader = DataLoader(
             train_ds,
@@ -339,7 +453,7 @@ def leave_one_video_out_cnn(
         y_tr = train_df["label"].astype(int).values
         cw = class_weights_from_labels(y_tr).to(device)
 
-        model = build_resnet18_binary(pretrained=pretrained).to(device)
+        model = build_resnet18_binary(pretrained=pretrained, in_channels=window_size).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         criterion = nn.CrossEntropyLoss(weight=cw)
 
@@ -357,6 +471,10 @@ def leave_one_video_out_cnn(
             all_video.append(str(row["video_name"]))
             all_center.append(int(row["center_frame"]))
 
+        # Prevent RAM from growing across folds: without this, each LOO iteration adds
+        # newly visited clips until every video stays decoded at once ("Killed" / OOM).
+        cache.clear()
+
     y_true_np = np.array(all_true, dtype=int)
     y_pred_np = np.array(all_pred, dtype=int)
     metrics = classification_metrics(y_true_np, y_pred_np)
@@ -365,6 +483,7 @@ def leave_one_video_out_cnn(
             "n_samples": int(len(y_true_np)),
             "n_videos_loo": int(len(videos)),
             "image_size": int(image_size),
+            "window_size": int(window_size),
             "pretrained": bool(pretrained),
             "epochs": int(epochs),
             "batch_size": int(batch_size),
@@ -411,6 +530,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.set_defaults(pretrained=USE_PRETRAINED)
     p.add_argument("--image-size", type=int, default=IMAGE_SIZE)
+    p.add_argument(
+        "--window-size",
+        type=int,
+        default=WINDOW_SIZE,
+        help="Number of frames stacked around center_frame (must be odd; 3/7/11).",
+    )
     p.add_argument("--epochs", type=int, default=EPOCHS)
     p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     p.add_argument("--lr", type=float, default=LEARNING_RATE)

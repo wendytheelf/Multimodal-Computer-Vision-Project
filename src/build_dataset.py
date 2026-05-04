@@ -15,12 +15,34 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
+import cv2
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LABELS_PATH = PROJECT_ROOT / "data" / "labels" / "contact_frames.csv"
+DEFAULT_RAW_DIR = PROJECT_ROOT / "data" / "spike_clips"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "processed"
 DEFAULT_OUTPUT_CSV = DEFAULT_OUTPUT_DIR / "dataset_windows.csv"
+
+
+def count_decoded_frames_bgr(video_path: str | Path) -> int:
+    """
+    Count frames the same way ``train_classical.load_all_frames_bgr`` / the CNN cache
+    read the file. This is the authoritative length for valid ``prev/curr/next``
+    indices; ``CAP_PROP_FRAME_COUNT`` and ``contact_frames.csv`` can disagree by 1+.
+    """
+    path = Path(video_path)
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return 0
+    n = 0
+    while True:
+        ok, _ = cap.read()
+        if not ok:
+            break
+        n += 1
+    cap.release()
+    return n
 
 
 def load_labels_csv(labels_path: str | Path) -> pd.DataFrame:
@@ -109,19 +131,55 @@ def build_samples_for_video(
     return rows
 
 
-def build_dataset_df(labels_df: pd.DataFrame, *, tolerance: int = 2) -> pd.DataFrame:
+def _effective_frame_count(
+    video_name: str,
+    csv_total: int,
+    raw_dir: Path,
+) -> int:
+    """
+    Use the **decoded** frame count when the file exists, so window indices always
+    match what training scripts load. Warn if the CSV and decoder disagree.
+    """
+    raw_dir = Path(raw_dir)
+    vp = raw_dir / video_name
+    if not vp.is_file():
+        return int(csv_total)
+    n_dec = count_decoded_frames_bgr(vp)
+    c = int(csv_total)
+    if n_dec < 3:
+        raise ValueError(
+            f"{video_name}: need at least 3 decodable frames for (t-1,t,t+1) windows, got {n_dec}."
+        )
+    if n_dec != c:
+        print(
+            f"[build_dataset] {video_name}: contact_frames total_frames={c} but "
+            f"decoder read {n_dec} frame(s); using n={n_dec} for windows (align CSV if you like)."
+        )
+    return n_dec
+
+
+def build_dataset_df(
+    labels_df: pd.DataFrame,
+    *,
+    tolerance: int = 2,
+    raw_dir: Path | None = None,
+) -> pd.DataFrame:
     """
     Concatenate all per-video rows into one DataFrame.
 
-    Column order is stable for readability in spreadsheets.
+    If ``raw_dir`` is set (default: ``data/spike_clips``), each video is decoded once
+    to get the true frame count; this avoids ``IndexError`` when ``total_frames`` in
+    the labels CSV is off by one vs OpenCV.
     """
     all_rows: list[dict] = []
+    rd: Path = Path(raw_dir) if raw_dir is not None else DEFAULT_RAW_DIR
     for _, row in labels_df.iterrows():
+        n = _effective_frame_count(str(row["video_name"]), int(row["total_frames"]), rd)
         all_rows.extend(
             build_samples_for_video(
                 str(row["video_name"]),
                 int(row["contact_frame"]),
-                int(row["total_frames"]),
+                n,
                 tolerance=tolerance,
             )
         )
@@ -224,6 +282,12 @@ def main() -> None:
         help="Frames within ±tolerance of contact_frame get label 1 (default 2).",
     )
     parser.add_argument(
+        "--raw-dir",
+        type=Path,
+        default=DEFAULT_RAW_DIR,
+        help="Folder with spike clips; used to count decoded frames per video (default: data/spike_clips).",
+    )
+    parser.add_argument(
         "--print-loo",
         action="store_true",
         help="Print leave-one-video-out fold sizes (train/test row counts).",
@@ -231,7 +295,9 @@ def main() -> None:
     args = parser.parse_args()
 
     labels_df = load_labels_csv(args.labels)
-    dataset_df = build_dataset_df(labels_df, tolerance=args.tolerance)
+    dataset_df = build_dataset_df(
+        labels_df, tolerance=args.tolerance, raw_dir=Path(args.raw_dir)
+    )
     out_path = save_dataset_csv(dataset_df, args.output)
 
     print(f"Wrote {len(dataset_df)} rows -> {out_path}")
