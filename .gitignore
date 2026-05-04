@@ -1,5 +1,32 @@
-# Spike clip videos (large files; keep out of git)
+# --- Raw spike clips (large; not redistributable in-repo) ---
 /data/spike_clips/
 /data/spike clips/
 /data/spike_clips/**/*.mp4
 /data/spike clips/**/*.mp4
+
+# Cached, regenerable features (rebuild with src/features_pose.py / features_audio.py)
+/data/processed/features/
+
+# --- Model weights (auto-downloaded; don't commit) ---
+*.pt
+!models/*.task
+
+# --- Python virtualenv & caches ---
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Notebook checkpoints ---
+.ipynb_checkpoints/
